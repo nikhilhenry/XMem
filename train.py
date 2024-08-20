@@ -7,7 +7,6 @@ import random
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, ConcatDataset
-import torch.distributed as distributed
 
 from model.trainer import XMemTrainer
 from dataset.static_dataset import StaticTransformDataset
@@ -16,14 +15,6 @@ from dataset.vos_dataset import VOSDataset
 from util.logger import TensorboardLogger
 from util.configuration import Configuration
 from util.load_subset import load_sub_davis, load_sub_yv
-
-
-"""
-Initial setup
-"""
-# Init distributed environment
-distributed.init_process_group(backend="nccl")
-print(f'CUDA Device count: {torch.cuda.device_count()}')
 
 # Parse command line arguments
 raw_config = Configuration()
@@ -35,12 +26,6 @@ if raw_config['benchmark']:
 # Get current git info
 repo = git.Repo(".")
 git_info = str(repo.active_branch)+' '+str(repo.head.commit.hexsha)
-
-local_rank = torch.distributed.get_rank()
-world_size = torch.distributed.get_world_size()
-torch.cuda.set_device(local_rank)
-
-print(f'I am rank {local_rank} in this world of size {world_size}!')
 
 network_in_memory = None
 stages = raw_config['stages']
@@ -60,7 +45,7 @@ for si, stage in enumerate(stages_to_perform):
 
     config['single_object'] = (stage == '0')
 
-    config['num_gpus'] = world_size
+    config['num_gpus'] = 1 # force to run on single GPU instance
     if config['batch_size']//config['num_gpus']*config['num_gpus'] != config['batch_size']:
         raise ValueError('Batch size must be divisible by the number of GPUs.')
     config['batch_size'] //= config['num_gpus']
@@ -72,23 +57,17 @@ for si, stage in enumerate(stages_to_perform):
     """
     Model related
     """
-    if local_rank == 0:
-        # Logging
-        if config['exp_id'].lower() != 'null':
-            print('I will take the role of logging!')
-            long_id = '%s_%s' % (datetime.datetime.now().strftime('%b%d_%H.%M.%S'), config['exp_id'])
-        else:
-            long_id = None
-        logger = TensorboardLogger(config['exp_id'], long_id, git_info)
-        logger.log_string('hyperpara', str(config))
-
-        # Construct the rank 0 model
-        model = XMemTrainer(config, logger=logger, 
-                        save_path=path.join('saves', long_id, long_id) if long_id is not None else None, 
-                        local_rank=local_rank, world_size=world_size).train()
+    # Logging
+    if config['exp_id'].lower() != 'null':
+        print('I will take the role of logging!')
+        long_id = '%s_%s' % (datetime.datetime.now().strftime('%b%d_%H.%M.%S'), config['exp_id'])
     else:
-        # Construct model for other ranks
-        model = XMemTrainer(config, local_rank=local_rank, world_size=world_size).train()
+        long_id = None
+    logger = TensorboardLogger(config['exp_id'], long_id, git_info)
+    logger.log_string('hyperpara', str(config))
+
+    # Construct the rank 0 model
+    model = XMemTrainer(config, logger=logger,save_path=path.join('saves', long_id, long_id) if long_id is not None else None).train()
 
     # Load pertrained model if needed
     if raw_config['load_checkpoint'] is not None:
@@ -117,10 +96,8 @@ for si, stage in enumerate(stages_to_perform):
         random.seed(worker_seed)
 
     def construct_loader(dataset):
-        train_sampler = torch.utils.data.distributed.DistributedSampler(dataset, rank=local_rank, shuffle=True)
-        train_loader = DataLoader(dataset, config['batch_size'], sampler=train_sampler, num_workers=config['num_workers'],
-                                worker_init_fn=worker_init_fn, drop_last=True)
-        return train_sampler, train_loader
+        train_loader = DataLoader(dataset, config['batch_size'], num_workers=config['num_workers'], drop_last=True)
+        return train_loader
 
     def renew_vos_loader(max_skip, finetune=False):
         # //5 because we only have annotation for every five frames
@@ -170,14 +147,14 @@ for si, stage in enumerate(stages_to_perform):
                 (path.join(static_root, 'BIG_small'), 1, 5),
                 (path.join(static_root, 'HRSOD_small'), 1, 5),
             ], num_frames=config['num_frames'])
-        train_sampler, train_loader = construct_loader(train_dataset)
+        train_loader = construct_loader(train_dataset)
 
         print(f'Static dataset size: {len(train_dataset)}')
     elif stage == '1':
         increase_skip_fraction = [0.1, 0.3, 0.8, 100]
         bl_root = path.join(path.expanduser(config['bl_root']))
 
-        train_sampler, train_loader = renew_bl_loader(5)
+        train_loader = renew_bl_loader(5)
         renew_loader = renew_bl_loader
     else:
         # stage 2 or 3
@@ -186,7 +163,7 @@ for si, stage in enumerate(stages_to_perform):
         yv_root = path.join(path.expanduser(config['yv_root']), 'train_480p')
         davis_root = path.join(path.expanduser(config['davis_root']), '2017', 'trainval')
 
-        train_sampler, train_loader = renew_vos_loader(5)
+        train_loader = renew_vos_loader(5)
         renew_loader = renew_vos_loader
 
 
@@ -211,7 +188,6 @@ for si, stage in enumerate(stages_to_perform):
         while total_iter < config['iterations'] + config['finetune']:
             
             # Crucial for randomness! 
-            train_sampler.set_epoch(current_epoch)
             current_epoch += 1
             print(f'Current epoch: {current_epoch}')
 
@@ -225,12 +201,12 @@ for si, stage in enumerate(stages_to_perform):
                         max_skip_values = max_skip_values[1:]
                         change_skip_iter = change_skip_iter[1:]
                     print(f'Changing skip to {cur_skip=}')
-                    train_sampler, train_loader = renew_loader(cur_skip)
+                    train_loader = renew_loader(cur_skip)
                     break
 
                 # fine-tune means fewer augmentations to train the sensory memory
                 if config['finetune'] > 0 and not finetuning and total_iter >= config['iterations']:
-                    train_sampler, train_loader = renew_loader(cur_skip, finetune=True)
+                    train_loader = renew_loader(cur_skip, finetune=True)
                     finetuning = True
                     model.save_network_interval = 1000
                     break
@@ -246,5 +222,3 @@ for si, stage in enumerate(stages_to_perform):
             model.save_checkpoint(total_iter)
 
     network_in_memory = model.XMem.module.state_dict()
-
-distributed.destroy_process_group()

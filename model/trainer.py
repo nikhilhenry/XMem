@@ -25,17 +25,13 @@ class XMemTrainer:
         self.deep_update_prob = config['deep_update_prob']
         self.local_rank = local_rank
 
-        self.XMem = nn.parallel.DistributedDataParallel(
-            XMem(config).cuda(), 
-            device_ids=[local_rank], output_device=local_rank, broadcast_buffers=False)
-
         # Set up logger when local_rank=0
         self.logger = logger
         self.save_path = save_path
         if logger is not None:
             self.last_time = time.time()
             self.logger.log_string('model_size', str(sum([param.nelement() for param in self.XMem.parameters()])))
-        self.train_integrator = Integrator(self.logger, distributed=True, local_rank=local_rank, world_size=world_size)
+        self.train_integrator = Integrator(self.logger, distributed=False, local_rank=local_rank, world_size=world_size)
         self.loss_computer = LossComputer(config)
 
         self.train()
